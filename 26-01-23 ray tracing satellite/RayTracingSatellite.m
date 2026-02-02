@@ -116,7 +116,7 @@ classdef RayTracingSatellite < handle
             % Solar panels: positioned at Y = ±0.5m on Nadir surface (Z=0)
             panel1 = CuboidComponent([2.0, 0.025, 1.0], [0,  0.5125, 0], 'SolarPanel+Y');
             panel2 = CuboidComponent([2.0, 0.025, 1.0], [0, -0.5125, 0], 'SolarPanel-Y');
-            panel3 = CuboidComponent([2.0, 16.0, 0.1], [2.1, 0, -1], 'SolarPanelLarge');
+            panel3 = CuboidComponent([2.0, 16.0, 0.01], [1, 0, -1.4], 'SolarPanelLarge');
             components{end+1} = panel1;
             components{end+1} = panel2;
             components{end+1} = panel3;
@@ -234,9 +234,262 @@ classdef RayTracingSatellite < handle
             omega = obj.angular_velocity;
         end
 
-        function plot_satellite(obj)
+        function [area, cop] = compute_projected_area_and_cop(obj, direction)
+            % Compute projected surface area and center of pressure from a given direction
+            % Uses ray tracing to properly handle partial occlusion
+            %
+            % Input:
+            %   direction - Vector [x, y, z] indicating the direction from which
+            %               the satellite is viewed (e.g., sun direction)
+            %
+            % Output:
+            %   area - Total projected surface area (m²) - accounting for occlusion
+            %   cop  - Center of pressure position [x, y, z] in body frame (m)
+
+            % Normalize direction vector
+            direction = direction(:) / norm(direction);
+
+            all_vertices = [];
+            all_faces = [];
+            all_normals = [];
+            vertex_offset = 0;
+
+            % Collect all vertices, faces, and normals from components
+            for i = 1:length(obj.components)
+                comp = obj.components{i};
+                comp_vertices = comp.get_vertices();
+                comp_faces = comp.get_faces();
+                comp_normals = comp.get_face_normals();
+
+                all_vertices = [all_vertices; comp_vertices];
+                all_faces = [all_faces; comp_faces + vertex_offset];
+                all_normals = [all_normals; comp_normals];
+
+                vertex_offset = vertex_offset + 8;  % Each component has 8 vertices
+            end
+
+            % Process all front-facing faces
+            visible_faces = [];
+            for i = 1:size(all_faces, 1)
+                face_normal = all_normals(i, :)';
+                dot_prod = dot(face_normal, direction);
+
+                % Only consider front-facing faces (dot product > 0)
+                if dot_prod > 0
+                    % Get vertices of this face
+                    face_indices = all_faces(i, :);
+                    face_vertices = all_vertices(face_indices, :);
+
+                    % Calculate face area
+                    v1 = face_vertices(2, :) - face_vertices(1, :);
+                    v2 = face_vertices(4, :) - face_vertices(1, :);
+                    cross_prod = cross(v1, v2);
+                    face_area = 0.5 * norm(cross_prod);
+
+                    % For quad, also calculate second triangle
+                    v1 = face_vertices(3, :) - face_vertices(1, :);
+                    v2 = face_vertices(4, :) - face_vertices(1, :);
+                    cross_prod = cross(v1, v2);
+                    face_area = face_area + 0.5 * norm(cross_prod);
+
+                    % Project face area onto the view direction plane
+                    projected_area = face_area * abs(dot_prod);
+
+                    % Calculate face center
+                    face_center = mean(face_vertices, 1)';
+
+                    % Calculate visibility fraction using ray tracing from multiple samples
+                    visibility_fraction = obj.calculate_visibility_fraction(face_center, ...
+                                                                            face_vertices, ...
+                                                                            all_faces, ...
+                                                                            all_vertices, ...
+                                                                            all_normals, ...
+                                                                            direction, i);
+
+                    % Calculate visible area
+                    visible_area = projected_area * visibility_fraction;
+
+                    % Debug output for face visibility analysis
+                    fprintf('Face %d: proj_area=%.3f m²', i, projected_area);
+                    fprintf(', visibility=%.4f, visible_area=%.3f m²\n', visibility_fraction, visible_area);
+
+                    if visible_area > 1e-9  % Only include if some area is visible
+                        visible_faces = [visible_faces; struct('area', visible_area, ...
+                                                                'center', face_center)];
+                    end
+                end
+            end
+
+            % Calculate total projected area and center of pressure
+            area = 0;
+            cop = [0; 0; 0];
+
+            for i = 1:length(visible_faces)
+                face = visible_faces(i);
+                area = area + face.area;
+                cop = cop + face.area * face.center;
+            end
+
+            % Normalize center of pressure by total area
+            if area > 0
+                cop = cop / area;
+            else
+                cop = [0; 0; 0];
+            end
+        end
+
+        function visibility_fraction = calculate_visibility_fraction(obj, face_center, face_vertices, ...
+                                                                      all_faces, all_vertices, all_normals, ...
+                                                                      view_direction, face_index)
+            % Calculate visibility fraction by shooting rays from multiple points on the face
+            % Uses Monte Carlo sampling across the face surface
+            
+            num_samples = 10000;  % 10000 rays per face (~100x100 grid) for higher accuracy
+            visible_rays = 0;
+            
+            % Generate sample points across face (quad vertices 1-4)
+            for i = 1:sqrt(num_samples)
+                for j = 1:sqrt(num_samples)
+                    % Normalized coordinates in [0, 1]
+                    u = (i - 0.5) / sqrt(num_samples);
+                    v = (j - 0.5) / sqrt(num_samples);
+                    
+                    % Bilinear interpolation on quad
+                    % Sample point = (1-u)(1-v)*v0 + u(1-v)*v1 + u*v*v2 + (1-u)*v*v3
+                    sample_point = (1-u)*(1-v)*face_vertices(1,:) + ...
+                                   u*(1-v)*face_vertices(2,:) + ...
+                                   u*v*face_vertices(3,:) + ...
+                                   (1-u)*v*face_vertices(4,:);
+                    
+                    % Cast ray from the sample point on the face, looking backward
+                    % This is the most direct approach: start at the surface and check for occlusion
+                    ray_origin = sample_point;
+                    ray_direction = -view_direction;  % Rays travel backward away from view direction
+                    
+                    % Find the closest intersection with any other front-facing face
+                    % If an intersection exists, the ray is occluded
+                    closest_distance = inf;
+                    
+                    for k = 1:size(all_faces, 1)
+                        if k == face_index
+                            continue;  % Skip self
+                        end
+                        
+                        face_normal = all_normals(k, :)';
+                        dot_prod = dot(face_normal, view_direction);
+                        
+                        % Only check against front-facing faces
+                        if dot_prod > 0
+                            face_verts = all_vertices(all_faces(k, :), :);
+                            
+                            % Test ray intersection with quad (two triangles)
+                            [hit, dist] = obj.ray_triangle_intersection(ray_origin, ray_direction, ...
+                                                                         face_verts(1, :), face_verts(2, :), face_verts(3, :), ...
+                                                                         face_normal);
+                            if hit && dist < closest_distance
+                                closest_distance = dist;
+                            end
+                            
+                            [hit, dist] = obj.ray_triangle_intersection(ray_origin, ray_direction, ...
+                                                                         face_verts(1, :), face_verts(3, :), face_verts(4, :), ...
+                                                                         face_normal);
+                            if hit && dist < closest_distance
+                                closest_distance = dist;
+                            end
+                        end
+                    end
+                    
+                    % Ray is visible if no occlusion was found (no intersection)
+                    if isinf(closest_distance)
+                        visible_rays = visible_rays + 1;
+                    end
+                end
+            end
+            
+            % Visibility fraction is the percentage of rays that didn't hit anything
+            visibility_fraction = visible_rays / num_samples;
+        end
+
+        function [hit, distance] = ray_triangle_intersection(~, ray_origin, ray_direction, v0, v1, v2, face_normal)
+            % Möller-Trumbore ray-triangle intersection algorithm
+            % Also checks that the intersection is on the front side of the triangle
+            
+            epsilon = 1e-8;
+            
+            % Convert to column vectors if needed
+            ray_origin = ray_origin(:);
+            ray_direction = ray_direction(:) / norm(ray_direction);
+            v0 = v0(:);
+            v1 = v1(:);
+            v2 = v2(:);
+            
+            edge1 = v1 - v0;
+            edge2 = v2 - v0;
+            
+            h = cross(ray_direction, edge2);
+            a = dot(edge1, h);
+            
+            if abs(a) < epsilon
+                hit = false;
+                distance = inf;
+                return;
+            end
+            
+            f = 1.0 / a;
+            s = ray_origin - v0;
+            u = f * dot(s, h);
+            
+            if u < 0.0 || u > 1.0
+                hit = false;
+                distance = inf;
+                return;
+            end
+            
+            q = cross(s, edge1);
+            v = f * dot(ray_direction, q);
+            
+            if v < 0.0 || u + v > 1.0
+                hit = false;
+                distance = inf;
+                return;
+            end
+            
+            distance = f * dot(edge2, q);
+            
+            % Check that we're hitting the front of the triangle
+            if distance > epsilon
+                % Compute triangle normal
+                tri_normal = cross(edge1, edge2);
+                tri_normal = tri_normal / norm(tri_normal);
+                
+                % Only count as hit if ray is hitting from the correct side
+                % (ray approaching the triangle: dot(ray_direction, tri_normal) < 0)
+                if dot(ray_direction, tri_normal) < 0
+                    hit = true;
+                else
+                    hit = false;
+                    distance = inf;
+                end
+            else
+                hit = false;
+                distance = inf;
+            end
+        end
+
+        function plot_satellite(obj, varargin)
             % Visualize the satellite as a 3D rectangular prism
-            % Uses the vertices and faces for accurate geometry representation
+            % Optional input: projection_direction [x, y, z]
+            %
+            % Usage:
+            %   plot_satellite()                          % No projection
+            %   plot_satellite([4.5, 0, 1])              % Show projection direction
+
+            % Parse optional direction input
+            projection_direction = [];
+            if nargin > 1
+                projection_direction = varargin{1}(:);
+                projection_direction = projection_direction / norm(projection_direction);
+            end
 
             % Create figure if none exists
             figure;
@@ -258,6 +511,29 @@ classdef RayTracingSatellite < handle
                 % Plot vertices as points for debugging
                 plot3(comp_vertices(:,1), comp_vertices(:,2), comp_vertices(:,3), ...
                       'o', 'Color', colors{color_idx}, 'MarkerSize', 2, 'MarkerFaceColor', colors{color_idx});
+            end
+
+            % Plot projection direction if provided
+            if ~isempty(projection_direction)
+                % Calculate scale for visualization
+                all_vertices = obj.get_vertices();
+                max_dim = max(max(abs(all_vertices)));
+                arrow_length = 2 * max_dim;
+
+                % Draw arrow from center in projection direction
+                quiver3(0, 0, 0, projection_direction(1)*arrow_length, ...
+                        projection_direction(2)*arrow_length, projection_direction(3)*arrow_length, ...
+                        'Color', 'magenta', 'LineWidth', 2.5, 'MaxHeadSize', 0.8, ...
+                        'AlignVertexCenters', 'off');
+
+                % Calculate and plot center of pressure
+                [area, cop] = obj.compute_projected_area_and_cop(projection_direction);
+                plot3(cop(1), cop(2), cop(3), 'mo', 'MarkerSize', 10, 'MarkerFaceColor', 'm');
+                text(cop(1), cop(2), cop(3), sprintf('  CoP\n  Area: %.3f m²', area), ...
+                     'Color', 'magenta', 'FontSize', 9, 'FontWeight', 'bold');
+
+                % Draw line from origin to CoP
+                plot3([0, cop(1)], [0, cop(2)], [0, cop(3)], 'm--', 'LineWidth', 1.5);
             end
 
             % Add labels and formatting
@@ -308,9 +584,9 @@ classdef RayTracingSatellite < handle
             components{end+1} = bus;
 
             % Solar panels: positioned at Y = ±0.5m on Nadir surface (Z=0)
-            panel1 = CuboidComponent([2.0, 1.0, 0.025], [0,  1.1, 0], 'SolarPanel+Y');
-            panel2 = CuboidComponent([2.0, 1.0, 0.025], [0, -1.1, 0], 'SolarPanel-Y');
-            panel3 = CuboidComponent([2.0, 16.0, 0.1], [2.1, 0, -1], 'SolarPanelLarge');
+            panel1 = CuboidComponent([2.0, 1.0, 0.01], [0,  1.1, 0], 'SolarPanel+Y');
+            panel2 = CuboidComponent([2.0, 1.0, 0.01], [0, -1.1, 0], 'SolarPanel-Y');
+            panel3 = CuboidComponent([2.0, 16.0, 0.01], [1, 0, -1.4], 'SolarPanelLarge');
             components{end+1} = panel1;
             components{end+1} = panel2;
             components{end+1} = panel3;

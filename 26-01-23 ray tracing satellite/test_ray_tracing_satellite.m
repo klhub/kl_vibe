@@ -45,4 +45,18 @@ fprintf('Angular velocity after 1s: [%.4f, %.4f, %.4f] rad/s\n', omega_new(1), o
 fprintf('\n=== Satellite Visualization ===\n');
 satellite.plot_satellite();
 
+% Test projected area and center of pressure from a specific direction
+fprintf('\n=== Projected Area and Center of Pressure Analysis ===\n');
+% direction = [4.5, 0, 1];
+direction = [0, 0, 10];
+[area, cop] = satellite.compute_projected_area_and_cop(direction);
+fprintf('Projection direction (normalized): [%.4f, %.4f, %.4f]\n', ...
+    direction(1)/norm(direction), direction(2)/norm(direction), direction(3)/norm(direction));
+fprintf('Projected surface area: %.4f m²\n', area);
+fprintf('Center of pressure: [%.4f, %.4f, %.4f] m\n', cop(1), cop(2), cop(3));
+
+% Visualize with projection direction
+fprintf('\nGenerating visualization with projection direction...\n');
+satellite.plot_satellite(direction);
+
 fprintf('\n=== Test Completed Successfully ===\n');
